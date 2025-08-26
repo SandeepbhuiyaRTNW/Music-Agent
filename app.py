@@ -85,10 +85,29 @@ def generate(prompt=None, batch_size=1, max_len=512, temp=1.0, top_p=0.98, top_k
                         if param_name == "channel":
                             mask_ids = [i for i in mask_ids if i not in disable_channels]
                         elif param_name == "pitch":
-                            # Filter to only allow C major scale notes (C, D, E, F, G, A, B)
+                            # Enhanced C major filtering with musical intelligence
                             # C major scale: 0, 2, 4, 5, 7, 9, 11 (modulo 12)
                             c_major_notes = {0, 2, 4, 5, 7, 9, 11}  # C, D, E, F, G, A, B
-                            mask_ids = [i for i in mask_ids if (i - tokenizer.parameter_ids[param_name][0]) % 12 in c_major_notes]
+
+                            # Filter to C major notes, but keep a good range for musical expression
+                            filtered_mask_ids = []
+                            for token_id in mask_ids:
+                                pitch_value = token_id - tokenizer.parameter_ids[param_name][0]
+                                note_class = pitch_value % 12
+
+                                # Allow C major notes in a reasonable range (C2 to C7)
+                                if note_class in c_major_notes and 24 <= pitch_value <= 96:
+                                    filtered_mask_ids.append(token_id)
+
+                            # Ensure we always have some options (fallback to C major triad if needed)
+                            if len(filtered_mask_ids) < 3:
+                                # Add C major triad in middle octave as fallback
+                                base_offset = tokenizer.parameter_ids[param_name][0]
+                                for note in [60, 64, 67]:  # C4, E4, G4
+                                    if base_offset + note < len(tokenizer.parameter_ids[param_name]):
+                                        filtered_mask_ids.append(base_offset + note)
+
+                            mask_ids = filtered_mask_ids if filtered_mask_ids else mask_ids[:1]  # At least one option
                         mask[b, mask_ids] = 1
                 mask = mask.unsqueeze(1)
                 x = next_token_seq
@@ -170,16 +189,37 @@ def run(tab, mid_seq, continuation_state, continuation_select, instruments, drum
             mid.append(tokenizer.event2tokens(["key_signature", 0, 0, 0, 0 + 7, 0]))
         if bpm != 0:
             mid.append(tokenizer.event2tokens(["set_tempo", 0, 0, 0, bpm]))
+
+        # Enhanced C major setup with better musical context
         patches = {}
-        if instruments is None:
-            instruments = []
+        if instruments is None or len(instruments) == 0:
+            # Default to Acoustic Grand Piano for C major music
+            instruments = ["Acoustic Grand"]
+
+        # Always ensure Acoustic Grand is on channel 0 for primary melody
+        patches[0] = 0  # Acoustic Grand Piano (patch 0)
+        i = 1  # Start from channel 1 for additional instruments
+
         for instr in instruments:
+            if instr == "Acoustic Grand" and 0 in patches:
+                continue  # Already set as primary instrument
             patches[i] = patch2number[instr]
-            i = (i + 1) if i != 8 else 10
+            i = (i + 1) if i != 8 else 10  # Skip channel 9 (drums)
+
         if drum_kit != "None":
             patches[9] = drum_kits2number[drum_kit]
-        for i, (c, p) in enumerate(patches.items()):
-            mid.append(tokenizer.event2tokens(["patch_change", 0, 0, i + 1, c, p]))
+
+        # Add patch changes
+        for c, p in patches.items():
+            mid.append(tokenizer.event2tokens(["patch_change", 0, 0, 0, c, p]))
+
+        # Add a C major chord as musical context to help the model
+        if tokenizer.version == "v2":
+            # Add a gentle C major chord (C-E-G) to establish tonality
+            mid.append(tokenizer.event2tokens(["note", 0, 0, 0, 0, 60, 64, 960]))  # C4, medium velocity, half note
+            mid.append(tokenizer.event2tokens(["note", 0, 0, 0, 0, 64, 60, 960]))  # E4, slightly softer
+            mid.append(tokenizer.event2tokens(["note", 0, 0, 0, 0, 67, 60, 960]))  # G4, slightly softer
+
         mid = np.asarray([mid] * OUTPUT_BATCH_SIZE, dtype=np.int64)
         mid_seq = mid.tolist()
         if len(instruments) > 0:
